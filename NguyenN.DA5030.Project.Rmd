@@ -1,0 +1,1308 @@
+---
+title: "An ensemble model to predict Chlorophyll Fluorescence at a coastal site using monitoring data"
+date: "Fall 2025"
+author: "Ngoc Linh Nguyen"
+output: 
+  html_document:
+    df_print: paged
+    toc: true
+    toc_float: true
+    code_folding: show
+---
+
+## Setup and rendering helpers
+
+```{r packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(randomForest)
+library(neuralnet)
+```
+
+```{r rendertable() function}
+rendertable<- function(x,c) {
+  if (knitr::is_html_output()){
+    knitr::kable(x,caption=c)
+    }else{x}
+}
+```
+
+```{r ggplot theme mods}
+gg_rmwhitespace<-scale_y_continuous(expand=expansion(mult = c(0, 0.1)))
+
+gg_cat_barchart<-
+  theme(axis.ticks.x=element_blank(),
+        strip.background=element_blank(),
+        strip.text=element_text(face="bold",size=10),
+        plot.title=element_text(face="bold",size=14))
+```
+
+
+## Data attribution
+
+NOAA National Estuarine Research Reserve System (NERRS). System-wide Monitoring Program. Data accessed from the NOAA NERRS Centralized Data Management Office website: http://www.nerrsdata.org; accessed 12 October 2025. doi:10.25921/vw8a-8031.
+
+## Data Acquisition
+
+Data .csvs were retrieved for all years between 2010 and 2025, and then combined within R and written to new .csvs using the following (commented out) method:
+
+```{r}
+# path <- "./alldata"
+# nut_files <- list.files(path, pattern = "nut2.*\\.csv$", full.names = TRUE)
+# wq_files  <- list.files(path, pattern = "wq2.*\\.csv$",  full.names = TRUE)
+# met_files <- list.files(path, pattern = "met2.*\\.csv$", full.names = TRUE)
+#  
+# read_and_stack <- function(files) {
+#   do.call(rbind,
+#           lapply(files, read.csv, stringsAsFactors = FALSE)
+#           )
+#   }
+# 
+# nut <- read_and_stack(nut_files)
+# wq  <- read_and_stack(wq_files)
+# met <- read_and_stack(met_files)
+# 
+# write.csv(nut, "nut.csv", row.names = FALSE)
+# write.csv(wq,  "wq.csv",  row.names = FALSE)
+# write.csv(met, "met.csv", row.names = FALSE)
+```
+
+The nutrient data were not used due to low coverage; they are data from manual sampling instances, as opposed to passive measurements by permanent fixtures as is the case for water quality (wq) and meteorological (met) data.
+
+```{r read csvs}
+read.csv(url("https://www.dropbox.com/scl/fi/5wlya2fkvmt6r85x9c69x/wq.csv?rlkey=u35g8f94xjbw6s9p3clfqllhq&st=7q497wom&dl=1")) -> wq
+read.csv(url("https://www.dropbox.com/scl/fi/vytf4c1inlodfy2s9059e/met.csv?rlkey=fwml3mofurucnta5xq0kk0ovi&st=bjd2guq5&dl=1")) -> met
+```
+
+For `wq` and `met`, data is programmed to be collected for all measured variables at 15 minute intervals. The raw `wq` dataset has `r nrow(wq)` observations for `r ncol(wq)` dimensions (including QC flags), the raw `met` dataset has `r nrow(met)` observations for `r ncol(met)` dimensions (including QC flags).
+
+## Planned models
+
+This project explores using ridge-regularized multilinear regression (MLR), random (regression) forest (RF), and neural network (NN) algorithms for predicting chlorophyll fluorescence (as a proxy of coastal algal growth) at a coastal site, using monitoring data from the National Estuarine Research Reserve System's (NERRS) National Monitoring Program. Each model is first bagged as a homogeneous ensemble, then blended in a weighted heterogeneous ensemble. Certain key hyperparameters are tuned to illustrate their effects on models: Ridge lambda for MLR, depth/tree number for RF, layer size for NN, and individual weights for the ensemble. RMSE will be the evaluation metric.
+
+The models were chosen to cope with unavoidable collinearity in ecological data. RF and NN can learn nonlinear relationships; MLR offers interpretability, with ridge regularization reducing overfitting and providing a soft form of dimensionality reduction comparable to the implicit regularization in RF and NN.
+
+Ridge MLR will be implemented algebraicly, the RF model will be implemented with the `randomForest` package, and the NN model will be implemented with the `neuralnet` package.
+
+## Cleaning and filtering
+
+Prior to statistical exploration and description of what data are available for model building, cleaning and filtering steps are performed. 
+
+All features are associated with a quality flag, and the first cleaning/filtering steps will largely rely on these flags. The flag features follow the same pattern: `F_[variable]` is the quality flag for `[variable]`.
+
+### Creation of time features
+
+Observations are associated with datetime stamps, which are converted to more convenient features for manipulation. These are `mdy_hm` (POSIX class), `mdy` (Date), `my` (pseudo-Date; first day of month/year), `month` (ordered factor), and `year` (numeric). 
+
+These object encodings are chosen for convenience; none of these features will be used as-is in the model. These operations are also wrapped in a function as this will have to be done again at later stages.
+
+```{r make time measure dimensions}
+# function for any df with a mdy dimension
+regen_timemeasures <- function(d) {
+  mdycol<-d[["mdy"]]
+  
+  d$my <- format(mdycol, "%Y-%m-01")
+  
+  d$month <- factor(format(mdycol, "%b"))
+  levels(d$month) <- month.abb
+  
+  d$year <- as.numeric(format(mdycol, "%Y"))
+  
+  d$doy <- as.numeric(format(mdycol, "%j"))
+  
+  d
+}
+
+met$mdy_hm <- as.POSIXct(met$DatetimeStamp, format="%m/%d/%Y %H:%M", tz="EST")
+met$mdy <- as.Date(met$mdy_hm)
+regen_timemeasures(met) -> met
+
+wq$mdy_hm  <- as.POSIXct(wq$DateTimeStamp,  format="%m/%d/%Y %H:%M", tz="EST")
+wq$mdy <- as.Date(wq$mdy_hm)
+regen_timemeasures(wq) -> wq
+```
+
+### Station selection
+
+The dataset contains wq data from four different stations at locations with distinct ecological and physical characteristics. ChlFluor seasonal patterns and magnitude thus differ between them. The level of complexity implied would not be interpretable by the planned models, so wq from only one station is used. The Menauhant Yacht Club station ("wqbmhwq  ") is selected as it has the most datapoints for the target variable.
+
+```{r Fig.stationselection, class.source = 'fold-hide'}
+aggregate(ChlFluor ~ StationCode + month, data=wq, FUN=mean, na.rm = TRUE) -> temp
+
+ggplot(temp, aes(x = month, y = ChlFluor)) + facet_wrap(~StationCode) +
+  geom_col() +
+  labs(x = "Month", y = "Mean ChlFluor") +
+  theme_classic()+gg_rmwhitespace+gg_cat_barchart -> fig.stationselection
+
+fig.stationselection
+```
+
+```{r table of chl per station}
+table(wq[!is.na(wq$ChlFluor),]$StationCode) # wqbmhwq has the most datapoints for ChlFluor
+```
+
+### Pulling candidate features and usable observations
+
+Not all features in the raw dataset are candidate predictors, and many observations can be screened out at an early stage. In this step, `wq_pull` and `met_pull` dataframes are created, which retain only a subset of dimensions and observations of `wq` and `met`.
+
+Summary of `wq` -> `wq_pull` operations:
+
+* Retain only observations with fluorescence data with quality flag <0> (no issues) or <5> (fixed)
+
+* Retain only mdy, the target, and features: `Sal`inity, `Temp`erature
+
+* Remove (make NA) all `Sal` and `Temp` values with quality flags other than <0> and <5>
+
+Summary of `met` -> `met_pull` operations:
+
+* Retain only observations with (mdy) dates matching the dates of `wq_pull`
+
+* Retain only mdy, the target, and features: `ATemp`, `RH`, `BP`, `WSpd`, `SDWDir`, `TotPAR`, `TotPrcp`
+
+* Remove (make NA) all feature values with quality flags other than <0> and <5>
+
+```{r make wq_pull}
+wq_filter <- (!is.na(wq$ChlFluor) & 
+                wq$ChlFluor >= 0 & 
+                wq$StationCode=="wqbmhwq  " & # Menauhant
+                grepl("^<0>|^<5>", wq$F_ChlFluor)
+              )
+
+wq_cols <- c("mdy","Sal","F_Sal","Temp","F_Temp","ChlFluor")
+
+wq_pull <- subset(wq,wq_filter)[,wq_cols]
+
+# NA non-quality entries
+wq_pull$Sal[!grepl("^<0>|^<5>", wq_pull$F_Sal)] <- NA
+wq_pull$Temp[!grepl("^<0>|^<5>", wq_pull$F_Temp)] <- NA
+
+# drop flag cols
+wq_pull$F_Sal <- NULL
+wq_pull$F_Temp <- NULL
+```
+
+```{r days in wq_pull}
+days <- unique(wq_pull$mdy)
+```
+
+```{r make met_pull}
+met_filter <- (met$mdy %in% days)
+
+met_cols <- c("mdy",
+              "ATemp","F_ATemp",
+              "RH","F_RH",
+              "BP","F_BP",
+              "WSpd","F_WSpd",
+              "SDWDir","F_SDWDir",
+              "TotPAR","F_TotPAR", #interval totals
+              "TotPrcp","F_TotPrcp") #interval totals
+
+met_pull <- subset(met,met_filter)[,met_cols]
+
+# NA non-quality entries
+flag_cols  <- grep("^F_", names(met_pull), value = TRUE)
+value_cols <- sub("^F_", "", flag_cols)
+
+for (i in seq_along(flag_cols)) {
+  v <- value_cols[i]
+  f <- flag_cols[i]
+  met_pull[[v]][ !grepl("^<0>|^<5>", met_pull[[f]]) ] <- NA
+}
+
+# drop flag column
+met_pull[flag_cols] <- NULL
+```
+
+### Description of variables 
+
+All variables are measured at 15 minute intervals.
+
+#### From met data
+
+* ATemp: Air temperature (degrees Celsius)
+
+* RH: average relative humidity (% saturation)
+
+* BP: average barometric pressure (mb)
+
+* WSpd: average wind speed (m/s)
+
+* SDWDir: wind direction standard deviation (sd)
+
+* TotPAR: total photosynthetically active radiation (mmol/m^2)
+
+* TotPrcp: total precipitation measured in millimeters (mm)  
+
+#### from wq data
+
+* Temp: Water temperature (degrees Celsius)
+
+* Sal: salinity (ppt)
+
+* ChlFluor (target): chlorophyll fluorescence (ug/L)
+
+## Feature engineering
+
+### Helper functions mean_at_least and sum_at_least
+
+These helper functions will be used in multiple instances while shaping the data. They call R's default mean() and sum() functions, but allow for specification of a threshold of non-NA values needed to apply `na.rm` (ie. ignore NA). The default threshold is 1, which is the default behavior when `na.rm`.
+
+```{r helper functions mean_at_least and sum_at_least}
+# if at least this many non NA do mean or sum
+
+# default is 1
+
+mean_at_least <- function(x, min_non_na = 1) {
+  non_na <- sum(!is.na(x))
+  if (non_na < min_non_na) {NA} else {mean(x, na.rm = TRUE)}
+  }
+
+sum_at_least <- function(x, min_non_na = 1) {
+  non_na <- sum(!is.na(x))
+  if (non_na < min_non_na) {NA} else {sum(x, na.rm = TRUE)}
+  }
+```
+
+### Aggregating daily means
+
+The feature values are aggregated as daily means. This smooths out the noise from the data collection method and local environment. Means of any number of different measurements are accepted. 
+
+```{r make wq_agg and met_agg}
+wq_agg <- aggregate(. ~ mdy, data=wq_pull, 
+                    FUN = mean_at_least,
+                    na.action = "na.pass") 
+
+met_agg <- aggregate(. ~ mdy, data=met_pull, 
+                    FUN = mean_at_least,
+                    na.action = "na.pass") 
+```
+The two datasets are joined by mdy to make `agg_df`, and time indicators are re-generated. `TotPAR` and `TotPrcp` means (mean total/15 minutes) are multiplied by 96 to estimate daily sums.
+
+```{r make agg_df}
+agg_df <-merge(met_agg,wq_agg,by="mdy")
+agg_df <- regen_timemeasures(agg_df)
+
+agg_df$TotPAR <- agg_df$TotPAR * 96
+agg_df$TotPrcp <- agg_df$TotPrcp * 96
+```
+
+The proportional missingness of daily mean features are inspected:
+```{r missingness table for agg_df}
+round(sort(colSums(is.na(agg_df)),decreasing=TRUE)/nrow(agg_df),3)
+```
+
+`TotPAR` and `TotPrcp`, both conceptually good candidates for the target, are the most missing features. No features are outright dropped at this stage so that imputation possibilities can be explored, but with such high missingness imputation would probably introduce substantial bias. 
+
+An exception is `ATemp`, which is understandably linearly correlated with `Temp` (r=`r cor(agg_df$ATemp,agg_df$Temp,use="pairwise.complete.obs")`). `ATemp` will be dropped as `Temp` has much lower missingness.
+
+```{r}
+agg_df$ATemp <- NULL
+```
+
+### Inspecting seasonality
+
+Before proceding to further feature engineering, seasonal patterns are visually inspected to guide seasonal encoding. The site is dominated by a spring bloom, with occasional fall blooms visible in some years and in monthly averages. To capture this with minimal complexity, both first and second annual harmonics (sin/cos terms at 1x and 2x yearly frequency) will be encoded in the feature engineering step. The harmonics give the models a smooth, low-dimensional way to learn yearly and half-year cycles.
+
+```{r seasonality plots, class.source = 'fold-hide'}
+ggplot(agg_df)+
+  aes(x=doy,y=ChlFluor)+
+  geom_bar(stat="summary",fun="mean")+
+  theme_classic() + gg_rmwhitespace +
+  labs(y="Mean ChlFluor", x="Day of year") -> chlfluor_mdy
+
+ggplot(agg_df)+
+  aes(x=doy,y=ChlFluor)+
+  geom_bar(stat="summary",fun="mean")+
+  theme_classic() + facet_wrap(~year,ncol=4) + gg_rmwhitespace +
+  labs(y="Mean ChlFluor", x="Day of year") -> chlfluor_mdy_year_wrap
+```
+
+```{r message=FALSE, class.source = 'fold-hide'}
+chlfluor_mdy + geom_smooth(se=FALSE,method="gam")
+```
+```{r, class.source = 'fold-hide'}
+chlfluor_mdy_year_wrap
+```
+
+### roll() helper function
+
+A helper function was designed as a wrapper for the `mean_at_least` and `sum_at_least` functions.
+
+```{r roll() helper function}
+# ATemp is removed as it is highly correlated with Temp, which has no missingness
+
+roll <- function(x, k, FUN, min_non_na = 1, ...) { # ... makes it so aggregate etc can pass random inert args 
+  n <- length(x) # length of the vector
+  out <- rep(NA, n) # output storage
+
+  for (i in seq_len(n)) { # 1 2 3 ... n
+    start <- max(1, i - k + 1) # last k days including today
+    window <- x[start:i] # the window of values to apply FUN on
+    out[i] <- FUN(window, min_non_na = min_non_na, ...)
+  }
+
+  out
+}
+```
+
+### Multiday means and seasonality components
+
+`acc_df`, derived from `agg_df`, includes daily means and sums as well as multi-day means/sums. It also includes terms for the first and second harmonic which allows models to handle yearly and twice-yearly seasonality.
+
+```{r temporary agg_df_full}
+# agg_df_full has all days between 2010-01-01 and 2025-11-28, with all-NA rows for days without data 
+all_days <- data.frame(
+  mdy = seq(min(days), max(days), by="day")
+  )
+
+agg_df_full <- merge(all_days, agg_df, by = "mdy", all.x = TRUE) # all.x inserts NA rows
+
+agg_df_full <- agg_df_full[order(agg_df_full$mdy), ]
+```
+
+```{r making acc_df}
+acc_df <- data.frame(
+  mdy = agg_df_full$mdy,
+  s1 = sin(2*pi*agg_df_full$doy/365), # year
+  c1 = cos(2*pi*agg_df_full$doy/365),
+  s2 = sin(4*pi*agg_df_full$doy/365), # half-year
+  c2 = cos(4*pi*agg_df_full$doy/365),
+  ChlFluor = agg_df_full$ChlFluor,
+  Temp = agg_df_full$Temp,
+  Temp_5d = roll(agg_df_full$Temp, 5, mean_at_least, min_non_na = 3),
+  Temp_10d = roll(agg_df_full$Temp, 10, mean_at_least, min_non_na = 9),
+  Sal = agg_df_full$Sal,
+  Sal_5d = roll(agg_df_full$Sal, 5, mean_at_least, min_non_na = 3),
+  Sal_10d = roll(agg_df_full$Sal, 10, mean_at_least, min_non_na = 9),
+  RH = agg_df_full$RH,
+  RH_5d = roll(agg_df_full$RH, 5, mean_at_least, min_non_na = 3),
+  BP = agg_df_full$BP,
+  BP_5d = roll(agg_df_full$BP, 5, mean_at_least, min_non_na = 3),
+  WSpd = agg_df_full$WSpd,
+  WSpd_5d = roll(agg_df_full$WSpd, 5, mean_at_least, min_non_na = 3),
+  SDWDir = agg_df_full$SDWDir,
+  SDWDir_5d = roll(agg_df_full$SDWDir, 5, mean_at_least, min_non_na = 3),
+  TotPrcp = agg_df_full$TotPrcp,
+  TotPrcp_3d = roll(agg_df_full$TotPrcp, 3, sum_at_least, min_non_na = 3),
+  TotPAR = agg_df_full$TotPAR,
+  TotPAR_3d = roll(agg_df_full$TotPAR, 3, sum_at_least, min_non_na = 3)
+)
+
+# back to only days with target
+acc_df<-acc_df[!is.na(acc_df$ChlFluor),]
+
+# regenerate
+acc_df <- regen_timemeasures(acc_df)
+```
+
+Below are the missingness proportions of features in `acc_df`.
+
+```{r  missingness table for acc_df}
+sum(complete.cases(acc_df)) -> completeobs
+round(sort(colSums(is.na(acc_df)),decreasing=TRUE)/nrow(acc_df),3)
+```
+
+## Distribution of features 
+
+The distributions of daily mean/sum predictors, multiday mean/sum predictors, and the target are visualized as histograms.
+
+```{r, fig.height=7, fig.width=7, class.source = 'fold-hide'}
+par(mfrow = c(5,4),
+  mar = c(2,2,4,1), 
+  oma = c(1,1,1,1))
+
+for (col in setdiff(names(acc_df),c("mdy","year","my","month","doy","s1","s2","c1","c2"))) {
+  
+  x <- acc_df[[col]]
+  x <- x[!is.na(x)]
+
+  hist(x,main = paste0(col, "\n"))}
+
+par(mfrow = c(1, 1))
+```
+Most predictors look roughly normal (salinity, RH, BP, WSpd—slightly right-skewed—and SDWDir), and their multi-day aggregated means/sums tighten the variance. Both are expected for environmental variables.
+
+The distributions for `TotPAR` and `Temp` appear to be roughly bimodal, likely reflecting seasonal regimes.
+
+The target `ChlFluor` is strongly right-skewed; log1p brings it closer to symmetry. `TotPrcp` is zero-inflated and remains skewed even after log1p, but the transform still reduces scale dominance.
+
+None of the chosen models require normal predictors, but log1p on `ChlFluor` and `TotPrcp` keeps scaling centered and tempers the influence of extreme blooms or storms, which helps the ridge MLR (and to a lesser extent RF/NN) fit without a few large events being overly influential.
+
+```{r}
+# this step can be done for the whole dataset as it is a deterministic transformation
+acc_df$ChlFluor <- log1p(acc_df$ChlFluor)
+
+acc_df$TotPrcp <- log1p(acc_df$TotPrcp)
+
+acc_df$TotPrcp_3d <-  log1p(acc_df$TotPrcp_3d)
+```
+
+## Feature selection
+
+### Selecting variables
+
+```{r, class.source = 'fold-hide'}
+cor(acc_df[,setdiff(names(acc_df),c("mdy","year","my","month","doy"))],use="pairwise.complete.obs") |> round(2) -> cor_acc
+# not printing that
+
+cor_long <- as.data.frame(as.table(cor_acc))
+
+ggplot(cor_long, aes(Var1, Var2, fill=Freq))+
+  geom_tile(color = "white")+
+  scale_fill_gradient2(
+    low="red", mid="white", high="red",
+    midpoint= 0, limits = c(-1, 1)
+    )+
+  coord_equal()+ # makes everything square
+  labs(fill="correlation")+
+  theme(axis.text.x=element_text(angle=45, hjust=1),
+        panel.grid=element_blank())
+
+```
+
+
+```{r some r square pulls for narrative purposes, class.source = 'fold-hide'}
+summary(lm(data=acc_df,Temp_5d~s1+c1))->summarytemplm
+
+cor(acc_df$WSpd_5d, acc_df$Temp, use = "pairwise.complete.obs") -> wspd_5d_temp_cor
+```
+
+Multicollinearity isn’t disqualifying when the goal is prediction. Regression coefficients may be unstable and less interpretable, but the chosen evaluation metric of RMSE only cares about the combined fit. Redundant or weak predictors would be trimmed mainly to cut noise and computation, not because collinearity is forbidden.
+
+All three planned models do soft feature selection implicitly: Ridge regularization penalizes coefficients, RF limits depth/splits, NN weight decay/dropout and small architectures effectively down-weigh noisy inputs. These models were chosen knowing environmental predictors are inherently correlated.
+
+To gauge redundancy, pairwise correlations and a few simple linear fits were examined. Seasonal harmonics (s1, c1) explain much of the variance in water temperature (`Temp_5d ~ s1 + c1` has R² ~= `r round(summarytemplm$r.squared,2)`), illustrating how the harmonics capture the annual cycle. Outside of within-lag correlations (e.g., `Temp_5d` vs. `Temp`), the strongest cross-feature relationship was a negative link between `WSpd_5d` and `Temp` (r ~= `r round(wspd_5d_temp_cor,3)`). It's colder on Menauhant Beach when it'd been windy; this is probably the sea breeze's effect.
+
+Only `SDWDir` and `TotPAR` were ultimately dropped. `SDWDir` was removed on conceptual grounds (but also because it’s highly missing and hard to impute); it’s a proxy for more detailed local dynamics that are out of scope. `TotPAR` would be a strong predictor, but it’s missing more than half the time (in long blocks), so imputation risked heavy bias. Seasonality and temperature would likely carry its signal better than an imputed dimension.
+
+### Selecting within lag groups
+
+The same-variable lag groups are just smoothed versions of the same signal, and only one candidate from each set will be retained, so a more targeted approach was used to differentiate between lags. Principal component analyses were applied to the redundant same-feature lag groups. This was deemed more appropriate than a blanket application over all dimensions as it directly attacks known redundancies and preserves some semblance of physical meaning for a dataset and pipeline where domain-specific judgement will be needed. 
+
+Also for the sake of preserving interpretability, PCA is used here only as a diagnostic to help choose between lags; the PCs will not be used themselves. For this purpose, individual loadings were compared. Only the output for salinity is shown in this report (below) as this was the group for which PC1 loadings were most different between lags (PC1 is slightly more weighed on Sal_5d), though even here the difference in minimal. 
+
+```{r salinity PCA}
+sal_df <- acc_df[, c("Sal", "Sal_5d", "Sal_10d")]
+sal_df <- sal_df[complete.cases(sal_df), ]
+sal_pca <- prcomp(sal_df, scale. = TRUE)
+
+sal_pca$rotation
+```
+
+The final decision is to retain 5-day means of `Temp`, `Sal`, `RH`, and `WSpd`, as well as the 3-day `TotPrcp` sum. This is again more based on conceptual understanding as well as the fact that these multi-day aggregates smooth noise and down-weight short-lived extremes, which suits small-sample models and reduces overfitting to isolated events.
+
+## Handling missingness
+
+The retained predictors are missing in structured patterns rather than at random, which risks bias if imputed naively. A count of co-missingness patterns' occurence shows that many gaps cluster together; even if all rows with 3 or more missing predictors are dropped, the sample loss would be smaller than if missingness were independent. This was ultimately the strategy for removing highly missing rows. That said, because the gaps are not MCAR, any fill or drop strategy can shift distributions - an important caveat for interpreting model results. The patterns of missingness are summarized in the following table:
+
+```{r, class.source = 'fold-hide'}
+vars <- c("Temp_5d", "Sal_5d", "RH_5d", "BP_5d", "WSpd_5d", "TotPrcp_3d")
+
+missing_patterns <- acc_df |> 
+  mutate(across(all_of(vars), ~ ifelse(is.na(.x), " ", "OK"))) |> 
+  count(across(all_of(vars))) |>       
+  arrange(desc(n)) |>
+  mutate(
+    n_NAs = rowSums(across(all_of(vars), ~ .x != "OK")),
+    decision = case_when(n_NAs == 0 ~ "",
+                         n_NAs %in% 1:2 ~ "impute",
+                         n_NAs >= 3 ~ "drop")
+    ) 
+
+missing_patterns$n_NAs <- NULL
+
+rendertable(missing_patterns,"")
+
+#missing_patterns[!missing_patterns$decision=="drop",]$n |> sum() #3639
+```
+
+After applying the rule, the missingness proportions of the retained features are:
+
+```{r making final pre split full dataset, class.source = 'fold-hide'}
+na_count <- rowSums(is.na(acc_df[vars]))
+
+#mdy will be retained for splitting purposes, my retained for imputation purposes
+df <- acc_df[na_count < 3, c("mdy","s1","c1","s2","c2","ChlFluor","Temp_5d","Sal_5d","RH_5d","BP_5d","WSpd_5d","TotPrcp_3d")]
+df <- regen_timemeasures(df) #for convenience, will drop
+
+round(sort(colSums(is.na(df)),decreasing=TRUE)/nrow(df),3)
+```
+
+With fewer missing variables, imputation will introduce less bias. Missing `TotPrcp_3d`, `RH_5d`, `Sal_5d`, `BP_5d`, `WSpd_5d` values will be imputed with monthly means, with fallback static values of 0, 75, 30, 1013, and 1.5 respectively. These are values typical of the site. Monthly means are a common ecological default, and the fallback is rarely used given the post-filter missingness.
+
+## Splitting and defining folds
+
+The figure below shows the time coverage of the working dataset:
+
+```{r visualize coverage, class.source = 'fold-hide'}
+hist(df$mdy,breaks="month",freq=TRUE,
+     xaxt = "n")
+
+yrs <- seq(
+  as.Date(format(min(df$mdy), "%Y-01-01")),
+  as.Date(format(max(df$mdy), "%Y-01-01")),
+  by = "year"
+)
+
+axis(1, at = yrs, labels = format(yrs, "%Y"))
+
+```
+
+The number of available days for each year is summarized:
+
+```{r inspect large gap and obs/year table, class.source = 'fold-hide'}
+df$year |> table()
+max(df[df$year==2015,]$mdy) -> max2015
+min(df[df$year==2016,]$mdy) -> min2016
+```
+
+Splits are time-aware: data are grouped by year, not randomly. There is a period of sparse data from early 2015 to mid 2016, and no data at all for 2022 and 2023, so 2024–2025 are held out as the test set. The train/validation pool is folded mostly by single years, with one fold combining 2015 and 2016 to bridge the gap.
+
+```{r ftrs vector}
+ftrs <- c("s1","c1","s2","c2","Temp_5d","Sal_5d","RH_5d","BP_5d","WSpd_5d","TotPrcp_3d")
+```
+
+```{r test}
+test <- df[df$year>2022,]
+```
+
+```{r train-val pool}
+tv <- df[df$year<=2022,]
+```
+
+```{r make fold id dimension}
+tv$fold_id <- NA
+
+tv$fold_id[tv$year %in% 2010:2014] <- as.character(tv$year[tv$year %in% 2010:2014])
+tv$fold_id[tv$year %in% c(2015, 2016)] <- "2015_2016"
+tv$fold_id[tv$year %in% 2017:2021] <- as.character(tv$year[tv$year %in% 2017:2021])
+
+```
+
+The CV folds are stored in a list for convenience:
+
+```{r}
+# just in case
+temp<-aggregate(year ~ fold_id, data = tv, FUN = min)
+ordered_fold_ids<-temp[order(temp$year),]$fold_id
+
+fold_holder <- list()
+k <- 1 
+
+for (i in seq_along(ordered_fold_ids)) {
+  if (i <= 3) next
+  
+  val_fold <- ordered_fold_ids[i]
+  train_folds <- ordered_fold_ids[(i - 3):(i - 1)]
+  
+  train_idx <- which(tv$fold_id %in% train_folds)
+  val_idx <- which(tv$fold_id == val_fold)
+  
+  fold_holder[[k]] <- list(
+    train_folds = train_folds,
+    val_fold = val_fold,
+    train = tv[train_idx, ],
+    val = tv[val_idx, ]
+  )
+  
+  k <- k + 1
+}
+```
+
+## Imputation helper
+
+A helper function is defined for mean-imputation in both training and testing sets, based on training set values.
+
+```{r fold-level imputation helper}
+impute_fold <- function(train_df,
+                        val_df,
+                        vars,
+                        fallbacks # a vector of values named for the var they are fallbacks for
+                        ) {
+
+  # train_month_means has colums for each vars, rows for each month
+  train_month_means <- aggregate(train_df[vars], 
+                                 by = list(month = train_df$month),
+                                 FUN = function(x) {
+                                   if (all(is.na(x))) {NA} else {mean(x, na.rm = TRUE)}
+                                   }
+                                 )
+  
+  # function to fill one data frame (train or val)
+  fill_df <- function(d) {
+    
+    for (v in vars) {
+      
+      nas <- is.na(d[[v]]) # is.na mask for the var's vector
+      if (!any(nas)) next
+      
+      # months for the rows with NA
+      months_vector <- d$month[nas]
+      
+      # lookup monthly means for those months and that variable, store as vector
+      imp <- train_month_means[match(months_vector, train_month_means$month), v]
+      
+      # where training had no data for that month → fallback
+      imp[is.na(imp)] <- fallbacks[v]
+      
+      d[[v]][nas] <- imp
+    }
+    d
+  }
+  
+  list(
+    train = fill_df(train_df),
+    val = fill_df(val_df)
+    )
+  }
+
+
+```
+
+## Scaling helper
+
+Scaling is required for MLR and NN to keep coefficients and gradients stable. RF doesn’t need it, but will still be fed the scaled set so all three models operate on the same feature space and can be compared and blended consistently in the ensemble.
+
+```{r fold-level scaling helper}
+scale_fold <- function(train_df, val_df, vars) {
+  
+  means <- sapply(train_df[vars], mean, na.rm = TRUE)
+  sds <- sapply(train_df[vars], sd, na.rm = TRUE)
+  
+  scale_df <- function(d) {
+    for (v in vars) {
+      d[[v]] <- (d[[v]] - means[v]) / sds[v] # use params from train!
+    }
+    
+    d
+  }
+
+  list(
+    train = scale_df(train_df),
+    val = scale_df(val_df),
+    means = means, # in case inspect later
+    sds = sds 
+  )
+
+}
+```
+
+## Applying imputation and scaling
+
+Given the already determined data partitions, imputation and scaling decisions can be applied in advance.
+
+For fold-wise CV, imputation and scaling must be applied for each fold.
+
+```{r apply impute to all tv folds}
+vars_to_impute <- c("TotPrcp_3d", "RH_5d", "Sal_5d", "BP_5d", "WSpd_5d")
+fallbacks <- c(TotPrcp_3d = 0, RH_5d = 75, Sal_5d = 30, BP_5d = 1013, WSpd_5d = 1.5)
+
+fold_holder_imputed <- lapply(fold_holder, 
+                              function(fold) {
+                                imp <- impute_fold(train_df = fold$train, 
+                                                   val_df = fold$val, 
+                                                   vars = vars_to_impute,
+                                                   fallbacks = fallbacks )
+                                
+                                list(train_folds = fold$train_folds,
+                                    val_fold = fold$val_fold,
+                                    train = imp$train,
+                                    val = imp$val
+                                    )
+                                }
+                              )
+```
+
+```{r apply scaling to all tv folds}
+vars_to_scale <- c("ChlFluor","Temp_5d","Sal_5d",
+                   "RH_5d","BP_5d","WSpd_5d","TotPrcp_3d")
+
+fold_holder_scaled <- lapply(fold_holder_imputed, function(fold) {
+  sc <- scale_fold(train_df=fold$train, val_df=fold$val, vars=vars_to_scale)
+  list(
+    train_folds = fold$train_folds,
+    val_fold = fold$val_fold,
+    train = sc$train,
+    val = sc$val,
+    means = sc$means,
+    sds = sc$sds
+    )
+  }
+  )
+```
+
+The same imputing and scaling is also applied to the full tv pool as "train" and on the testing set. These will be used for model evaluation.
+
+```{r}
+imp_full <- impute_fold(train_df = tv, val_df = test, vars = vars_to_impute, fallbacks = fallbacks)
+
+tv_imputed <- imp_full$train 
+test_imputed <- imp_full$val
+
+sc_full <- scale_fold(train_df = tv_imputed, val_df = test_imputed, vars = vars_to_scale)
+
+tv_scaled <- sc_full$train
+test_scaled <- sc_full$val
+
+# for converting back to original units
+y_mean <- sc_full$means["ChlFluor"]
+y_sd <- sc_full$sds["ChlFluor"]
+```
+
+## Evaluation helper functions
+
+`rmse()` will be used to compute RMSE. `rmse_orig()` is used to compute RMSE in orginal `ChlFluor` units. 
+
+```{r rmse()}
+rmse <- function(truth, pred) {sqrt(mean((truth - pred)^2, na.rm=TRUE))}
+```
+
+```{r}
+unscale_unlog1p <- function(v, v_sd, v_mean) {
+  expm1(v * v_sd + v_mean)
+}
+```
+
+```{r rmse_orig()}
+rmse_orig <- function(y_true_scaled, y_pred_scaled, y_mean, y_sd) {
+  
+  # unlog1p
+  y_true_orig <- unscale_unlog1p(y_true_scaled, y_sd, y_mean)
+  y_pred_orig <- unscale_unlog1p(y_pred_scaled, y_sd, y_mean)
+  
+  # RMSE in original units
+  sqrt(mean((y_true_orig - y_pred_orig)^2, na.rm = TRUE))
+}
+
+```
+
+## The Ridge MLR bag
+
+### Fitting functions
+
+The `ridge_fit` function solves $\hat\beta=(X'X+\lambda I)^{-1}X'Y$, returning a vector of coefficients which minimize $SSE + \lambda\times\beta$. This vector can be used in `ridge_predict` to computed predicted $\hat y$ when these coefficients are applied.
+
+```{r ridge_fit and ridge_predict}
+ridge_fit <- function(X, y, lambda) {
+  # X is a matrix of predictors
+  # y is response
+  # lambda is the ridge penalty
+  
+  p <- ncol(X) # number of predictors
+  
+  XtX <- crossprod(X) # X'X, size is p x p
+  Xty <- crossprod(X, y) # X'Y, size is p x 1
+  
+  beta <- solve(XtX + lambda * diag(p), Xty) # diag(p) is identitity matrix
+  drop(beta) # drop -> return as vector (instead of single column matrix)
+}
+
+# output can be fed to rdige_predict
+ridge_predict <- function(beta, X_new) {
+  drop(X_new %*% beta) # dot product of each row of X by coefficient vector beta
+}
+
+```
+
+
+```{r}
+## DEMO ONLY ## 
+train_X_example <- as.matrix(fold_holder_scaled[[1]]$train[, ftrs])
+
+train_y_example <- as.matrix(fold_holder_scaled[[1]]$train$ChlFluor)
+
+ridgemodel_example <- ridge_fit(train_X_example,train_y_example,1000)
+
+ridgemodel_example
+
+#ridge_predict(ridgemodel_example, as.matrix(fold_holder_scaled[[1]]$val[,ftrs]))
+```
+
+
+The bagged versions:
+```{r bag_ridge_fit and bag_ridge_predict}
+bag_ridge_fit <- function(X, y, lambda, B) {
+  # B is the number of bootstrap models
+  
+  n <- nrow(X)
+  betas <- vector("list", B) # beta storage
+  
+  for (b in seq_len(B)) {
+
+    boot_idx <- sample.int(n, size=n, replace=TRUE) # get some numbers 
+    
+    # get the rows from train
+    X_boot <- X[boot_idx,,drop = FALSE]
+    y_boot <- y[boot_idx]
+    
+    # vector of lists of betas
+    betas[[b]] <- ridge_fit(X_boot, y_boot, lambda = lambda)
+  }
+  
+  list(
+    betas = betas,
+    lambda = lambda,
+    B = B
+    )
+}
+
+# output can be fed to bag_ridge_predict
+bag_ridge_predict <- function(bag_model, X_new) {
+
+  B <- bag_model$B
+  betas <- bag_model$betas
+
+  # each column = predictions from one bagged model
+  pred_mat <- sapply(betas, function(b) ridge_predict(b, X_new))
+
+  # average across bags
+  drop(rowMeans(pred_mat))
+}
+```
+
+### Tuning lambda using cross-validation 
+
+As bagging multiplies compute demands, lambda will be tuned with non-bagged fits.
+
+```{r}
+lambda_grid <- c(0, 0.001, 0.01, 0.1, 1, 10, 100, 1000, 10000)
+
+cv_results <- data.frame(lambda = lambda_grid, mean_rmse = NA)
+
+for (l in seq_along(lambda_grid)) {
+  
+  lam <- lambda_grid[l]
+  
+  fold_rmses <- numeric(length(fold_holder_scaled))
+  
+  for (f in seq_along(fold_holder_scaled)) {
+    fold <- fold_holder_scaled[[f]]
+    train <- fold$train
+    val <- fold$val
+    
+    X_train <- as.matrix(train[, ftrs])
+    y_train <- train$ChlFluor
+    X_val <- as.matrix(val[, ftrs])
+    y_val <- val$ChlFluor
+
+    beta_hat <- ridge_fit(X_train, y_train, lambda = lam)
+    y_hat <- ridge_predict(beta_hat, X_val)
+
+    fold_rmses[f] <- rmse(y_val, y_hat)
+  }
+
+  cv_results$mean_rmse[l] <- mean(fold_rmses, na.rm = TRUE)
+}
+
+cv_results$lambda[which.min(cv_results$mean_rmse)] -> chosen_lambda 
+```
+
+While the optimal lambda `r chosen_lambda` is high, testing on individual folds show that the coefficients are still distinct for the predictors. The fact that RMSE is best on average across folds when lambda is high indicates a lack of strong, stable predictors, so strong regularization is needed to generalize.
+
+### Evaluating MLR homogenous ensemble
+
+```{r}
+set.seed(12345)
+
+X_full_tv <- as.matrix(tv_scaled[, ftrs]) 
+y_full_tv <- tv_scaled$ChlFluor
+
+X_test  <- as.matrix(test_scaled[, ftrs])
+y_test  <- test_scaled$ChlFluor
+
+MLR_bag <- bag_ridge_fit(X_full_tv, y_full_tv, lambda = chosen_lambda, B = 50)
+y_hat_MLR <- bag_ridge_predict(MLR_bag, X_test)
+
+rmse_mlr <- rmse(y_test, y_hat_MLR) 
+
+rmse_orig_mlr <- rmse_orig(y_test, y_hat_MLR, y_mean, y_sd) 
+```
+
+The RMSE for the homogenous MLR bag is `r rmse_mlr` (or `r rmse_orig_mlr` ug/L in original units).
+
+## The NN bag
+
+### Fitting functions
+
+```{r nn fitting functions}
+nn_formula <- as.formula(paste("ChlFluor ~", paste(ftrs, collapse = " + "))) 
+
+nn_fit <- function(train_df, 
+                   hidden, # vector of sizes
+                   act = "logistic", # activation function
+                   ...) { # ... is other features to pass
+  
+  neuralnet(nn_formula,
+            data = train_df,
+            hidden = hidden,          
+            act.fct = act,
+            linear.output = TRUE, # regression on scaled target
+            ...)
+  }
+
+# output of nn_fit can be fed as model
+nn_predict <- function(model, new_df) {
+  drop(compute(model, new_df[, ftrs])$net.result)
+}
+
+```
+
+The bagged version:
+```{r nn bagged fitting functions}
+bag_nn_fit <- function(train_df, hidden, B, ...) {
+  
+  n <- nrow(train_df)
+  models <- vector("list", B)
+
+  for (b in seq_len(B)) {
+    idx <- sample.int(n, size = n, replace = TRUE)
+    models[[b]] <- nn_fit(train_df[idx, ], hidden = hidden, ...)
+  }
+
+  models
+}
+
+bag_nn_predict <- function(models, new_df) {
+  pred_mat <- sapply(models, function(m) nn_predict(m, new_df))
+  rowMeans(pred_mat)
+}
+```
+
+
+### Tuning hidden size
+
+Fold-wise CV was run on non-bagged models. To keep the file runnable, the loop below uses only the final hidden-size choice as a demonstration. Each fold runs 3 reps to smooth out unlucky starts, with learning rate 0.01, threshold 0.1, and using the algorithm `rprop+` (resilient backpropagation with weight backtracking). On this small dataset, the chosen architecture gave the best balance of RMSE and stability across seeds - slightly lower RMSEs from deeper (two narrow-layer) nets weren’t worth the frequent convergence issues and extra compute once bagged.
+
+```{r nn cv for layer sizes}
+set.seed(12345)
+
+hidden_grid <- list(c(5))
+
+cv_nn <- lapply(seq_along(hidden_grid), function(i) {
+  
+  h <- hidden_grid[[i]]
+  
+  rmses <- sapply(fold_holder_scaled, 
+                  function(fold) {
+                    m <- nn_fit(fold$train, hidden = h, 
+                                rep = 3, 
+                                stepmax = 1e7, 
+                                learningrate = 0.01, 
+                                threshold = 0.1,
+                                algorithm = "rprop+")
+                    
+                    preds <- nn_predict(m, fold$val)
+                    
+                    rmse(fold$val$ChlFluor, preds)
+                    }
+                  )
+  
+  data.frame(hidden = I(list(h)),
+       mean_rmse = mean(rmses),
+       sd_rmse = sd(rmses))
+})
+
+cv_nn <- do.call(rbind, cv_nn)
+
+chosen_hidden <- cv_nn$hidden[[which.min(cv_nn$mean_rmse)]]
+chosen_hidden
+```
+^ the chosen hidden layer size(s).
+
+### Evaluating NN homogenous ensemble
+
+`rep` is set to 1 for the bootstrap aggregated model due to compute demands.
+
+```{r NN eval}
+set.seed(12345)
+nn_bag <- bag_nn_fit(tv_scaled, 
+                     hidden = chosen_hidden, 
+                     B = 10, 
+                     rep = 1, 
+                     stepmax = 1e7, 
+                     learningrate = 0.01, 
+                     threshold = 0.1,
+                     algorithm = "rprop+",
+                     #lifesign = "minimal"
+                     )
+
+y_hat_nn <- bag_nn_predict(nn_bag, test_scaled)
+
+rmse_nn_test <- rmse(test_scaled$ChlFluor, y_hat_nn)
+rmse_nn_test_orig <- rmse_orig(test_scaled$ChlFluor, y_hat_nn, y_mean, y_sd)
+```
+The RMSE for the homogenous NN bag is `r rmse_nn_test` (or `r rmse_nn_test_orig` ug/L in original units).
+
+```{r}
+## DEMO ONLY ## 
+set.seed(12345)
+nn_bag_example <- bag_nn_fit(tv_scaled, 
+                     hidden = chosen_hidden, 
+                     B = 10, 
+                     rep = 1, 
+                     stepmax = 1e7, 
+                     learningrate = 0.01, 
+                     threshold = 0.1,
+                     algorithm = "rprop+",
+                     #lifesign = "minimal"
+                     )
+
+y_hat_nn_example <- bag_nn_predict(nn_bag_example, test_scaled)
+
+rmse_nn_test_example <- rmse(test_scaled$ChlFluor, y_hat_nn_example)
+rmse_nn_test_orig_example <- rmse_orig(test_scaled$ChlFluor, y_hat_nn_example, y_mean, y_sd)
+```
+
+
+## The RF bag
+
+### Fitting functions
+
+```{r rf_fit and rf_predict}
+rf_fit <- function(train_df, mtry, nodesize, ntree) {
+  randomForest(
+    ChlFluor ~ ., data = train_df[, c("ChlFluor", ftrs)],
+    mtry = mtry, nodesize = nodesize, ntree = ntree,
+    replace = TRUE, importance = FALSE
+  )
+}
+
+rf_predict <- function(model, new_df) {
+  predict(model, newdata = new_df[, ftrs])
+}
+```
+
+Bagged:
+
+```{r bag_rf_fit and bag_rf_predict}
+bag_rf_fit <- function(train_df, mtry, nodesize, ntree, B = 20) {
+  lapply(seq_len(B), function(b) {
+    rf_fit(train_df, mtry = mtry, nodesize = nodesize, ntree = ntree)
+  })
+}
+
+bag_rf_predict <- function(models, new_df) {
+  preds <- sapply(models, rf_predict, new_df = new_df)
+  rowMeans(preds)
+}
+```
+
+
+### Tuning ntree and mtry
+
+Not all tested combinations are shown in this demonstration.
+
+```{r tuning ntree and mtry}
+mtry_grid <- c(2, 5, 10)  
+ntree_grid <- c(500,1000)
+nodesize <- 5
+
+cv_rf_list <- lapply(mtry_grid, function(mt) {
+  
+  lapply(ntree_grid, function(nt) {
+    
+    rmses <- sapply(fold_holder_scaled, function(fold) {
+      m <- rf_fit(fold$train,
+                  mtry = mt,
+                  nodesize = nodesize,
+                  ntree = nt)
+      pred <- rf_predict(m, fold$val)
+      rmse(fold$val$ChlFluor, pred)
+      }
+    )
+    
+    data.frame(mtry = mt, ntree = nt, mean_rmse = mean(rmses), sd_rmse = sd(rmses))
+  })
+})
+
+cv_rf <- do.call(rbind, unlist(cv_rf_list, recursive = FALSE))
+best_par <- cv_rf[which.min(cv_rf$mean_rmse), c("mtry","ntree")]
+best_par 
+```
+The best mean RMSE was obtained when mtry = `r best_par$mtry` and ntree = `r best_par$ntree`, with a node size fixed at 5.
+
+### Evaluating RF homogenous ensemble
+
+```{r RF eval}
+set.seed(12345)
+rf_bag <- bag_rf_fit(tv_scaled,
+                     mtry = best_par$mtry,
+                     nodesize = nodesize,
+                     ntree = best_par$ntree,
+                     B = 40)
+
+y_hat_rf <- bag_rf_predict(rf_bag, test_scaled)
+
+rmse_rf_test <- rmse(test_scaled$ChlFluor, y_hat_rf)
+rmse_rf_test_orig <- rmse_orig(test_scaled$ChlFluor, y_hat_rf, y_mean, y_sd)
+```
+The RMSE for the homogenous RF bag is `r rmse_rf_test` (or `r rmse_rf_test_orig` ug/L in original units).
+
+
+## Heterogenous ensemble
+
+The ensemble is tuned using fold-wise CV for the weights of models.
+
+```{r ensemble weight tuning, message=FALSE}
+set.seed(12345)
+
+# out-of-fold predictions from tuned base learners
+fold_preds <- lapply(fold_holder_scaled, function(fold) {
+  
+  # MLR
+  beta_hat <- ridge_fit(as.matrix(fold$train[, ftrs]),
+                        fold$train$ChlFluor,
+                        lambda = chosen_lambda)
+  mlr_hat <- ridge_predict(beta_hat, as.matrix(fold$val[, ftrs]))
+  
+  # NN
+  nn_mod <- nn_fit(fold$train,
+                   hidden = chosen_hidden,
+                   rep = 1,
+                   stepmax = 1e6,
+                   learningrate = 0.01,
+                   threshold = 0.1,
+                   algorithm = "rprop+")
+  nn_hat <- nn_predict(nn_mod, fold$val)
+  
+  # RF
+  rf_mod <- rf_fit(fold$train,
+                   mtry = best_par$mtry,
+                   nodesize = nodesize,
+                   ntree = best_par$ntree)
+  rf_hat <- rf_predict(rf_mod, fold$val)
+  
+  data.frame(
+    y   = fold$val$ChlFluor,
+    mlr = mlr_hat,
+    nn  = nn_hat,
+    rf  = rf_hat
+    )
+  }
+  )
+
+# grid over weights (w1 = MLR, w2 = NN, w3 = RF)
+w_grid <- expand.grid(
+  w1 = seq(0.1, 1, by = 0.1),
+  w2 = seq(0.1, 1, by = 0.1)
+  )
+
+w_grid <- subset(w_grid, w1 + w2 < 1)
+w_grid$w3 <- 1 - w_grid$w1 - w_grid$w2
+
+w_grid$mean_rmse <- apply(w_grid, 1, function(w) {
+  fold_means <- sapply(fold_preds, function(fp) {
+    ens <- w["w1"] * fp$mlr + w["w2"] * fp$nn + w["w3"] * fp$rf
+    rmse(fp$y, ens)
+  })
+  mean(fold_means)
+})
+
+best_weights <- w_grid[which.min(w_grid$mean_rmse), ]
+best_weights
+
+```
+Unfortunately, the answer in our case is essentially that rmse for a weighted average ensemble is minimized by limiting the influence of the worse RF and NN models as much as possible. This is attributable to the MLR model's lower prediction variance. 
+
+```{r predict_ensemble function}
+predict_ensemble <- function(newdata_scaled=test_scaled[,ftrs],
+                             newdata_unscaled=test_imputed[,ftrs], 
+                             mlr_weight=best_weights$w1,
+                             nn_weight=best_weights$w2,
+                             rf_weight=best_weights$w3) {
+  
+  mlr_pred <- bag_ridge_predict(MLR_bag,as.matrix(newdata_scaled))
+  nn_pred <- bag_nn_predict(nn_bag,newdata_scaled)
+  rf_pred <- bag_rf_predict(rf_bag,newdata_scaled)
+  
+  ensemble_pred <- mlr_weight * mlr_pred + nn_weight * nn_pred + rf_weight * rf_pred
+  
+  ensemble_pred
+
+}
+```
+
+```{r rmse(predict_ensemble())}
+rmse(predict_ensemble(), test_scaled$ChlFluor) -> ensemble_rmse
+rmse_orig(predict_ensemble(), test_scaled$ChlFluor, y_mean, y_sd) -> ensemble_rmse_orig
+```
+The RMSE for the ensemble model is `r ensemble_rmse` (or `r ensemble_rmse_orig` ug/L in original units).
+
+## Discussion
+
+### {.tabset}
+
+```{r example predictions df for plots}
+set.seed(12345)
+data.frame(Date = test_imputed$mdy, Test = test_imputed$ChlFluor,
+        ML = bag_ridge_predict(MLR_bag,as.matrix(test_scaled[,ftrs]))*y_sd+y_mean, 
+        NN = bag_nn_predict(nn_bag,test_scaled[,ftrs])*y_sd+y_mean, 
+        RF = bag_rf_predict(rf_bag,test_scaled[,ftrs])*y_sd+y_mean,
+        Ensemble = predict_ensemble()*y_sd+y_mean) -> resultsdf
+```
+
+```{r, class.source = 'fold-hide'}
+results_long <- data.frame(
+  Date = rep(resultsdf$Date, 5),
+  Source = factor(rep(c("Test", "MLR", "NN", "RF", "Ensemble"), each = nrow(resultsdf))),
+  Value = c(resultsdf$Test, resultsdf$ML, resultsdf$NN, resultsdf$RF, resultsdf$Ensemble)
+  )
+
+ggplot(results_long[results_long$Source%in%c("MLR","Test"),], aes(x = Date, y = Value, color = Source)) +
+  geom_point(size=1) +
+  labs(x="Date", y="log1p(ChlFluor)", color="Source") +
+  scale_color_manual(values=c("blue", "grey"))+
+  theme_classic() -> mlr_vs_truth
+
+ggplot(results_long[results_long$Source%in%c("NN","Test"),], aes(x = Date, y = Value, color = Source)) +
+  geom_point(size=1) +
+  labs(x="Date", y="log1p(ChlFluor)", color="Source") +
+  scale_color_manual(values=c("magenta", "grey"))+
+  theme_classic() -> nn_vs_truth
+
+ggplot(results_long[results_long$Source%in%c("RF","Test"),], aes(x = Date, y = Value, color = Source)) +
+  geom_point(size=1) +
+  labs(x="Date", y="log1p(ChlFluor)", color="Source") +
+  scale_color_manual(values=c("forestgreen", "grey"))+
+  theme_classic() -> rf_vs_truth
+
+ggplot(results_long[results_long$Source%in%c("Ensemble","Test"),], aes(x = Date, y = Value, color = Source)) +
+  geom_point(size=1) +
+  labs(x="Date", y="log1p(ChlFluor)", color="Source") +
+  scale_color_manual(values=c("purple", "grey"))+
+  theme_classic() -> ensemble_vs_truth
+```
+
+#### MLR
+
+```{r}
+mlr_vs_truth
+```
+
+#### NN
+
+```{r}
+nn_vs_truth
+```
+
+#### RF
+
+```{r}
+rf_vs_truth
+```
+
+#### Ensemble
+
+```{r}
+ensemble_vs_truth
+```
+
+
+### 
+
+As seen in the above plots of example predictions, all three homogenous bagged models (and the heavily MLR-weighed ensemble) under-shoot the peaks and troughs. The 2022–2023 gap and the regularization choices likely contribute, and RMSE favors the smoother, lower-variance Ridge MLR, even though it isn’t clearly more “correct” than RF/NN. RF and NN are noisier but their peaks and troughs better align with the true pattern in shape and timing. Even as an exploratory setup, an underestimating model could still be useful for bloom outlooks if calibrated or used to flag timing of maxima/minima rather than exact magnitudes.
+
+Ridge-regularized MLR is linear but stable under collinearity and small samples, so it delivers the lowest variance and thus the lowest RMSE even though it likely underfits non-linear bloom dynamics. RF can model interactions and non-linearity with little preprocessing, but with few years of data and many missing blocks it smooths aggressively. NN is the most flexible but also the most data- and compute-hungry. With this small, irregular series it is prone to instability, so bagging and small architectures were needed to keep it usable. The results reflect these traits: MLR is smooth and scores best on RMSE, while RF/NN capture peaks and troughs a bit better in timing but with more noise.
+
+Homogeneous bagging reduces variance within each model class, but their biases differ. The heterogeneous ensemble was meant to blend those biases, yet the CV weight search largely suppresses RF/NN because the stable MLR dominates RMSE. That suggests limited complementarity among the base learners on this dataset. A meta-learner (such as with stacking) or a larger feature set might let RF/NN add more value, but with current data the ensemble collapses toward MLR. 
+
+The sample is small, contains many large gaps, and missingness is structured, so any imputation or split choice can shift distributions. The hyperparameter grids and NN depth were constrained to keep runs feasible on a personal computer, so a broader search or more folds wasn’t practical. All results should be read with those constraints in mind.
